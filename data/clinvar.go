@@ -1,83 +1,91 @@
 package data
 
 import (
-    "encoding/json"
+    "encoding/xml"
     "fmt"
     "net/http"
     "net/url"
     "strings"
 )
 
-type ClinvarVariant struct {
-    HGVS             string // e.g. "p.R273C"
-    ClinSignificance string // e.g. "Pathogenic"
-    Up               bool   // true for Pathogenic/Likely pathogenic
+// ClinVarVariant holds a protein‐level change (HGVS) and its classification.
+type ClinVarVariant struct {
+    ProteinChange  string
+    Classification string
 }
 
-// GetClinvarVariants fetches all missense variants from ClinVar for the given gene symbol.
-func GetClinvarVariants(gene string) ([]ClinvarVariant, error) {
-    // 1. ESearch to get list of RCV IDs
-    esearch := "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+// GetClinVarMissense retrieves all human missense variants for `gene`
+// from ClinVar via the Entrez E-utilities (esearch + efetch) :contentReference[oaicite:0]{index=0}.
+func GetClinVarMissense(gene string) ([]ClinVarVariant, error) {
+    // 1) esearch to get ClinVar IDs
+    esearchURL := "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
     params := url.Values{
-        "db":    {"clinvar"},
-        "term":  {fmt.Sprintf("%s[gene] AND missense[variant type]", gene)},
-        "retmax": {"1000"},
-        "retmode": {"json"},
+        "db":      {"clinvar"},
+        "term":    {fmt.Sprintf("%s[gene] AND missense AND human[orgn]", gene)},
+        "retmax":  {"10000"},
+        "retmode": {"xml"},
     }
-    res, err := http.Get(esearch + "?" + params.Encode())
+    resp, err := http.Get(esearchURL + "?" + params.Encode())
     if err != nil {
         return nil, err
     }
-    defer res.Body.Close()
+    defer resp.Body.Close()
 
-    var e struct {
-        ESrchResult struct{ IdList []string } `json:"esearchresult"`
+    var es ESearchResult
+    if err := xml.NewDecoder(resp.Body).Decode(&es); err != nil {
+        return nil, err
     }
-    if err := json.NewDecoder(res.Body).Decode(&e); err != nil {
+    if len(es.IDList) == 0 {
+        return nil, nil
+    }
+
+    // 2) efetch to retrieve variant details
+    efetchURL := "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+    params2 := url.Values{
+        "db":      {"clinvar"},
+        "retmode": {"xml"},
+        "id":      {strings.Join(es.IDList, ",")},
+    }
+    resp2, err := http.Get(efetchURL + "?" + params2.Encode())
+    if err != nil {
+        return nil, err
+    }
+    defer resp2.Body.Close()
+
+    var records ClinVarRecords
+    if err := xml.NewDecoder(resp2.Body).Decode(&records); err != nil {
         return nil, err
     }
 
-    // 2. Batch EFetch to get summaries
-    var variants []ClinvarVariant
-    for _, id := range e.ESrchResult.IdList {
-        efetch := "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-        params = url.Values{"db": {"clinvar"}, "id": {id}, "retmode": {"json"}}
-        resp, err := http.Get(efetch + "?" + params.Encode())
-        if err != nil {
-            return nil, err
+    // 3) Extract only those records with a protein‐level HGVS change
+    var out []ClinVarVariant
+    for _, r := range records.Variants {
+        if r.HGVSProtein == "" {
+            continue
         }
-        defer resp.Body.Close()
-
-        var out struct {
-            ClinicalAssertionList struct {
-                ClinicalAssertion []struct {
-                    TraitSet struct {
-                        List []struct {
-                            XRef struct {
-                                ID   string `json:"id"`
-                                Type string `json:"db"`
-                            } `json:"xref"`
-                        } `json:"traitset"`
-                    } `json:"traitset"`
-                    VariantIdentification struct {
-                        HGVS string `json:"hgvs"` // protein HGVS
-                    } `json:"variantid"`
-                    ClinicalSignificance struct {
-                        Description string `json:"description"`
-                    } `json:"clinicalsignificance"`
-                } `json:"clinicalassertionlist"`
-            } `json:"clinicalassertionlist"`
-        }
-        if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-            return nil, err
-        }
-
-        for _, ca := range out.ClinicalAssertionList.ClinicalAssertion {
-            hgvs := ca.VariantIdentification.HGVS
-            sig := ca.ClinicalSignificance.Description
-            up := strings.EqualFold(sig, "Pathogenic") || strings.EqualFold(sig, "Likely pathogenic")
-            variants = append(variants, ClinvarVariant{HGVS: hgvs, ClinSignificance: sig, Up: up})
-        }
+        out = append(out, ClinVarVariant{
+            ProteinChange:  r.HGVSProtein,
+            Classification: r.ClinicalSignificance,
+        })
     }
-    return variants, nil
+    return out, nil
+}
+
+// ESearchResult represents the output of esearch.fcgi
+type ESearchResult struct {
+    XMLName xml.Name `xml:"eSearchResult"`
+    IDList  []string `xml:"IdList>Id"`
+}
+
+// ClinVarRecords represents the efetch output
+type ClinVarRecords struct {
+    XMLName  xml.Name        `xml:"ClinVarSet"`
+    Variants []ClinVarRecord `xml:"ReferenceClinVarAssertion"`
+}
+
+// ClinVarRecord extracts the protein change and clinical significance
+type ClinVarRecord struct {
+    // Adjust the XPath below to match exactly where the HGVS(p.) is in the XML:
+    HGVSProtein         string `xml:"ClinVarAssertion>TraitSet>Trait>Name>ElementValue"`
+    ClinicalSignificance string `xml:"ClinicalSignificance>Description"`
 }
